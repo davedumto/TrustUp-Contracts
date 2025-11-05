@@ -1,11 +1,13 @@
 [workspace]
 members = [
-    "contracts/escrow-contract",
-    "contracts/creditline-contract",
     "contracts/reputation-contract",
-    "contracts/pool-contract",
 ]
 resolver = "2"
+
+# Future contracts:
+# - contracts/creditline-contract
+# - contracts/merchant-registry-contract
+# - contracts/adapter-trustless-contract
 
 [profile.release]
 opt-level = "z"
