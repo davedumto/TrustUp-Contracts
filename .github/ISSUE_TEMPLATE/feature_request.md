@@ -1,37 +1,23 @@
 ---
-name: Feature request
-about: Suggest an idea for this project
-title: ''
-labels: ''
+name: Feature Request
+about: Suggest a new feature or enhancement
+title: '[FEATURE] '
+labels: 'enhancement'
 assignees: ''
-
 ---
 
----
-name: Feature template 
-about: Feature issue template
-title: ''
-labels: ''
-assignees: ''
+> 📚 **Documentation**: See [docs/](../../docs/) for project context and standards
 
----
-
-## 🔖 Title
-<!-- Brief and clear. Describe the specific task -->
-
----
+## 🔖 Feature Title
+<!-- Brief and clear. What functionality are you proposing? -->
 
 ## 📄 Description
-<!-- Explain what needs to be done and why it's important -->
-
----
+<!-- Detailed explanation of the feature and why it's needed -->
 
 ## ✅ Tasks to complete
 - [ ] <!-- Step 1 -->
 - [ ] <!-- Step 2 -->
 - [ ] <!-- Step 3 -->
-
----
 
 ## 🗒️ Additional notes
 <!-- Extra considerations, edge cases, dependencies or reminders -->
