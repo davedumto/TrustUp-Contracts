@@ -37,6 +37,11 @@ pub fn emit_loan_defaulted(
 ) {
     env.events().publish(
         (LOAN_DEFAULTED, borrower, loan_id),
-        (total_amount, unpaid_balance, guarantee_forfeited, env.ledger().timestamp()),
+        (
+            total_amount,
+            unpaid_balance,
+            guarantee_forfeited,
+            env.ledger().timestamp(),
+        ),
     );
 }

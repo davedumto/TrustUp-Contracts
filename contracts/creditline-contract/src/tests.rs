@@ -1,7 +1,11 @@
 #![cfg(test)]
 
 use crate::{CreditLineContract, CreditLineContractClient, LoanStatus, RepaymentInstallment};
-use soroban_sdk::{Address, Env, contract, contractimpl, testutils::{Address as _, Ledger}};
+use soroban_sdk::{
+    contract, contractimpl,
+    testutils::{Address as _, Ledger},
+    Address, Env,
+};
 
 // NOTE: Integration tests with reputation contract are skipped for now
 // They will be added when all contracts are implemented and properly configured
@@ -509,7 +513,7 @@ fn test_mark_defaulted_success() {
     let client = CreditLineContractClient::new(&env, &contract_id);
 
     // Register our Mock Reputation contract
-    let rep_id = env.register(MockReputation, ()); 
+    let rep_id = env.register(MockReputation, ());
 
     let admin = Address::generate(&env);
     let user = Address::generate(&env);
@@ -519,14 +523,14 @@ fn test_mark_defaulted_success() {
     client.initialize(
         &admin,
         &rep_id, // Pass the Mock ID
-        &Address::generate(&env), 
+        &Address::generate(&env),
         &liquidity_pool,
     );
 
     // Set a baseline time
     let current_time = 10000;
     env.ledger().set_timestamp(current_time);
-    
+
     let mut schedule = soroban_sdk::Vec::new(&env);
     schedule.push_back(RepaymentInstallment {
         amount: 1000,
@@ -537,7 +541,7 @@ fn test_mark_defaulted_success() {
     let loan_id = client.create_loan(&user, &merchant, &1000, &200, &schedule);
 
     // Time Travel past the due date
-    env.ledger().set_timestamp(12000); 
+    env.ledger().set_timestamp(12000);
 
     // This calls mark_defaulted which internally calls MockReputation::slash
     client.mark_defaulted(&loan_id);
@@ -555,20 +559,25 @@ fn test_mark_defaulted_too_early_fails() {
     let contract_id = env.register(CreditLineContract, ());
     let client = CreditLineContractClient::new(&env, &contract_id);
 
-    let rep_id = env.register(MockReputation, ()); 
+    let rep_id = env.register(MockReputation, ());
 
     let admin = Address::generate(&env);
     let user = Address::generate(&env);
-    
-    client.initialize(&admin, &rep_id, &Address::generate(&env), &Address::generate(&env));
+
+    client.initialize(
+        &admin,
+        &rep_id,
+        &Address::generate(&env),
+        &Address::generate(&env),
+    );
 
     let current_time = 10000;
     env.ledger().set_timestamp(current_time);
-    
+
     let mut schedule = soroban_sdk::Vec::new(&env);
     schedule.push_back(RepaymentInstallment {
         amount: 1000,
-        due_date: 20000, 
+        due_date: 20000,
     });
 
     let loan_id = client.create_loan(&user, &Address::generate(&env), &1000, &200, &schedule);
