@@ -16,4 +16,5 @@ pub enum CreditLineError {
     InvalidAmount = 9,
     Overflow = 10,
     Underflow = 11,
+    LoanNotOverdue = 12,
 }

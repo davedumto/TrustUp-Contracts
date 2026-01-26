@@ -1,6 +1,6 @@
 #![no_std]
 use soroban_sdk::{
-    contract, contractimpl, panic_with_error, symbol_short, Address, Env, Symbol, Vec,
+    contract, contractimpl, panic_with_error, symbol_short, Address, Env, IntoVal, Symbol, Vec,
 };
 
 // Module imports
@@ -141,7 +141,6 @@ impl CreditLineContract {
         storage::set_liquidity_pool(&env, &address);
     }
 
-
     /// Validate guarantee amount is at least 20% of total amount
     fn validate_guarantee(env: &Env, total_amount: i128, guarantee_amount: i128) {
         if total_amount <= 0 || guarantee_amount <= 0 {
@@ -218,6 +217,61 @@ impl CreditLineContract {
         // Example: liquidity_pool_client.get_available_liquidity()
         // For now, we assume liquidity is sufficient
         let _ = required_from_pool;
+    }
+
+    pub fn mark_defaulted(env: Env, loan_id: u64) -> Result<(), CreditLineError> {
+        // 1. Validation: Loan must exist
+        let mut loan = storage::read_loan(&env, loan_id).ok_or(CreditLineError::LoanNotFound)?;
+
+        // 2. Validation: Loan must be Active
+        if loan.status != LoanStatus::Active {
+            return Err(CreditLineError::LoanNotActive);
+        }
+
+        // 3. Validation: Check if past final payment date
+        // We look at the last installment in the schedule
+        let last_installment = loan
+            .repayment_schedule
+            .last()
+            .ok_or(CreditLineError::Overflow)?; // Should never happen with valid loans
+
+        if env.ledger().timestamp() <= last_installment.due_date {
+            return Err(CreditLineError::LoanNotOverdue);
+        }
+
+        // 4. Transfer guarantee to Liquidity Pool
+        let _lp_address =
+            storage::get_liquidity_pool(&env).ok_or(CreditLineError::InsufficientLiquidity)?;
+
+        // Note: In a real Soroban contract, you'd use a token client to move funds here.
+        // For Phase 3, we logic-gate the state change.
+
+        // 5. Update Status
+        loan.status = LoanStatus::Defaulted;
+        storage::write_loan(&env, &loan);
+
+        // 6. Emit Event
+        events::emit_loan_defaulted(
+            &env,
+            loan.borrower.clone(),
+            loan_id,
+            loan.total_amount,
+            loan.remaining_balance,
+            loan.guarantee_amount,
+        );
+
+        // 7. Trigger reputation decrease (Phase 4 placeholder)
+        if let Some(reputation_contract) = storage::get_reputation_contract(&env) {
+            // Only attempt the call if we aren't in a test or if you've set up a mock
+            // For now, let's just make sure the call is reachable
+            env.invoke_contract::<()>(
+                &reputation_contract,
+                &symbol_short!("slash"),
+                (loan.borrower,).into_val(&env),
+            );
+        }
+
+        Ok(())
     }
 }
 
