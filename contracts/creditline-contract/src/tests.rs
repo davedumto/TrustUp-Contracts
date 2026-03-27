@@ -1,10 +1,15 @@
 use crate::{CreditLineContract, CreditLineContractClient, LoanStatus, RepaymentInstallment};
-use liquidity_pool_contract::PoolStats;
+use liquidity_pool_contract::{LiquidityPoolContract, LiquidityPoolContractClient, PoolStats};
 use merchant_registry_contract::MerchantRegistryContract;
+use parameters_contract::{
+    default_parameters, ParametersContract, ParametersContractClient, ProtocolParameters,
+};
+use reputation_contract::{ReputationContract, ReputationContractClient};
 use soroban_sdk::token::StellarAssetClient;
 use soroban_sdk::{
     contract, contractimpl,
     testutils::{Address as _, Events, Ledger},
+    token::Client as TokenClient,
     Address, Env, String as SorobanString,
 };
 
@@ -1882,4 +1887,282 @@ fn test_cannot_cancel_active_loan() {
     let loan_id = t.create_default_loan(&user, &merchant);
 
     t.client.cancel_loan(&user, &loan_id);
+}
+
+struct RealIntegrationCtx {
+    env: Env,
+    creditline: CreditLineContractClient<'static>,
+    reputation: ReputationContractClient<'static>,
+    merchant_registry: merchant_registry_contract::MerchantRegistryContractClient<'static>,
+    pool: LiquidityPoolContractClient<'static>,
+    parameters: ParametersContractClient<'static>,
+    token: TokenClient<'static>,
+    token_admin: StellarAssetClient<'static>,
+    admin: Address,
+    treasury: Address,
+    merchant_fund: Address,
+    creditline_id: Address,
+}
+
+impl RealIntegrationCtx {
+    fn setup() -> Self {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let admin = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        let merchant_fund = Address::generate(&env);
+
+        let token_admin_addr = Address::generate(&env);
+        let token_contract = env.register_stellar_asset_contract_v2(token_admin_addr);
+        let token_address = token_contract.address();
+        let token = TokenClient::new(&env, &token_address);
+        let token_admin = StellarAssetClient::new(&env, &token_address);
+
+        let reputation_id = env.register(ReputationContract, ());
+        let reputation = ReputationContractClient::new(&env, &reputation_id);
+
+        let merchant_registry_id = env.register(MerchantRegistryContract, ());
+        let merchant_registry = merchant_registry_contract::MerchantRegistryContractClient::new(
+            &env,
+            &merchant_registry_id,
+        );
+
+        let pool_id = env.register(LiquidityPoolContract, ());
+        let pool = LiquidityPoolContractClient::new(&env, &pool_id);
+
+        let parameters_id = env.register(ParametersContract, ());
+        let parameters = ParametersContractClient::new(&env, &parameters_id);
+
+        let creditline_id = env.register(CreditLineContract, ());
+        let creditline = CreditLineContractClient::new(&env, &creditline_id);
+
+        let token: TokenClient<'static> = unsafe { core::mem::transmute(token) };
+        let token_admin: StellarAssetClient<'static> = unsafe { core::mem::transmute(token_admin) };
+        let reputation: ReputationContractClient<'static> =
+            unsafe { core::mem::transmute(reputation) };
+        let merchant_registry: merchant_registry_contract::MerchantRegistryContractClient<'static> =
+            unsafe { core::mem::transmute(merchant_registry) };
+        let pool: LiquidityPoolContractClient<'static> = unsafe { core::mem::transmute(pool) };
+        let parameters: ParametersContractClient<'static> =
+            unsafe { core::mem::transmute(parameters) };
+        let creditline: CreditLineContractClient<'static> =
+            unsafe { core::mem::transmute(creditline) };
+
+        reputation.set_admin(&admin);
+        reputation.set_updater(&admin, &admin, &true);
+        reputation.set_updater(&admin, &creditline_id, &true);
+
+        merchant_registry.initialize(&admin);
+        pool.initialize(&admin, &token_address, &treasury, &merchant_fund);
+        pool.set_creditline(&admin, &creditline_id);
+        parameters.initialize_defaults(&admin);
+
+        creditline.initialize(
+            &admin,
+            &reputation_id,
+            &merchant_registry_id,
+            &pool_id,
+            &token_address,
+        );
+        creditline.set_parameters_contract(&admin, &parameters_id);
+
+        Self {
+            env,
+            creditline,
+            reputation,
+            merchant_registry,
+            pool,
+            parameters,
+            token,
+            token_admin,
+            admin,
+            treasury,
+            merchant_fund,
+            creditline_id,
+        }
+    }
+
+    fn mint(&self, to: &Address, amount: i128) {
+        self.token_admin.mint(to, &amount);
+    }
+
+    fn balance(&self, addr: &Address) -> i128 {
+        self.token.balance(addr)
+    }
+
+    fn fund_pool(&self, provider: &Address, amount: i128) {
+        self.mint(provider, amount);
+        self.pool.deposit(provider, &amount);
+    }
+
+    fn set_score(&self, user: &Address, score: u32) {
+        self.reputation.set_score(&self.admin, user, &score);
+    }
+
+    fn register_merchant(&self, merchant: &Address, name: &str) {
+        let merchant_name = SorobanString::from_str(&self.env, name);
+        self.merchant_registry
+            .register_merchant(&self.admin, merchant, &merchant_name);
+    }
+
+    fn single_installment(
+        &self,
+        amount: i128,
+        due_date: u64,
+    ) -> soroban_sdk::Vec<RepaymentInstallment> {
+        let mut schedule = soroban_sdk::Vec::new(&self.env);
+        schedule.push_back(RepaymentInstallment { due_date, amount });
+        schedule
+    }
+}
+
+#[test]
+fn test_real_asset_transfers_on_create_and_repay() {
+    let t = RealIntegrationCtx::setup();
+    let provider = Address::generate(&t.env);
+    let user = Address::generate(&t.env);
+    let merchant = Address::generate(&t.env);
+
+    t.fund_pool(&provider, 10_000);
+    t.register_merchant(&merchant, "Integrated Merchant");
+    t.set_score(&user, 80);
+    t.mint(&user, 1_300);
+
+    let pool_balance_before = t.balance(&t.pool.address);
+    let merchant_balance_before = t.balance(&merchant);
+    let creditline_balance_before = t.balance(&t.creditline_id);
+    let user_balance_before = t.balance(&user);
+
+    let due_date = t.env.ledger().timestamp() + 10_000;
+    let schedule = t.single_installment(1_000, due_date);
+    let loan_id = t
+        .creditline
+        .create_loan(&user, &merchant, &1_000, &200, &schedule);
+
+    assert_eq!(t.balance(&user), user_balance_before - 200);
+    assert_eq!(t.balance(&merchant), merchant_balance_before + 800);
+    assert_eq!(t.balance(&t.creditline_id), creditline_balance_before + 200);
+    assert_eq!(t.balance(&t.pool.address), pool_balance_before - 800);
+
+    let pool_balance_after_loan = t.balance(&t.pool.address);
+    let loan_before_repay = t.creditline.get_loan(&loan_id);
+    let total_due = loan_before_repay.remaining_balance;
+    let total_interest =
+        loan_before_repay.interest_outstanding + loan_before_repay.service_fee_outstanding;
+    let lp_interest = total_interest * 8_500 / 10_000;
+    t.creditline.repay_loan(&user, &loan_id, &total_due);
+
+    assert_eq!(t.balance(&user), user_balance_before - total_due);
+    assert_eq!(t.balance(&t.creditline_id), 0);
+    assert_eq!(
+        t.balance(&t.pool.address),
+        pool_balance_after_loan + loan_before_repay.principal_outstanding + lp_interest
+    );
+
+    let loan = t.creditline.get_loan(&loan_id);
+    assert_eq!(loan.status, LoanStatus::Paid);
+    assert_eq!(loan.remaining_balance, 0);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #2)")]
+fn test_parameters_contract_controls_guarantee_thresholds() {
+    let t = RealIntegrationCtx::setup();
+    let provider = Address::generate(&t.env);
+    let user = Address::generate(&t.env);
+    let merchant = Address::generate(&t.env);
+
+    t.fund_pool(&provider, 10_000);
+    t.register_merchant(&merchant, "Governed Merchant");
+    t.set_score(&user, 90);
+    t.mint(&user, 300);
+
+    let params = ProtocolParameters {
+        min_guarantee_percent: 30,
+        ..default_parameters()
+    };
+    t.parameters.update_parameters(&t.admin, &params);
+
+    let due_date = t.env.ledger().timestamp() + 10_000;
+    let schedule = t.single_installment(1_000, due_date);
+    t.creditline
+        .create_loan(&user, &merchant, &1_000, &200, &schedule);
+}
+
+#[test]
+fn test_end_to_end_happy_path_across_all_contracts() {
+    let t = RealIntegrationCtx::setup();
+    let provider = Address::generate(&t.env);
+    let user = Address::generate(&t.env);
+    let merchant = Address::generate(&t.env);
+
+    t.fund_pool(&provider, 20_000);
+    t.register_merchant(&merchant, "Protocol Merchant");
+    t.set_score(&user, 80);
+    t.mint(&user, 1_300);
+
+    let share_price_before = t.pool.get_pool_stats().share_price;
+    let due_date = t.env.ledger().timestamp() + 10_000;
+    let schedule = t.single_installment(1_000, due_date);
+    let loan_id = t
+        .creditline
+        .create_loan(&user, &merchant, &1_000, &200, &schedule);
+
+    let loan_before_repay = t.creditline.get_loan(&loan_id);
+    let total_due = loan_before_repay.remaining_balance;
+    let total_interest =
+        loan_before_repay.interest_outstanding + loan_before_repay.service_fee_outstanding;
+    let protocol_fee_from_repayment = total_interest * 1_000 / 10_000;
+    let lp_interest = total_interest * 8_500 / 10_000;
+    let merchant_fee_from_repayment = total_interest - lp_interest - protocol_fee_from_repayment;
+    t.creditline.repay_loan(&user, &loan_id, &total_due);
+
+    let loan = t.creditline.get_loan(&loan_id);
+    assert_eq!(loan.status, LoanStatus::Paid);
+    assert_eq!(t.reputation.get_score(&user), 90);
+
+    t.mint(&t.creditline_id, 100);
+    t.pool.receive_repayment(&t.creditline_id, &0, &100);
+
+    let stats_after_interest = t.pool.get_pool_stats();
+    assert!(stats_after_interest.share_price > share_price_before);
+    assert_eq!(t.balance(&t.treasury), protocol_fee_from_repayment + 10);
+    assert_eq!(t.balance(&t.merchant_fund), merchant_fee_from_repayment + 5);
+}
+
+#[test]
+fn test_end_to_end_default_path_guarantee_and_penalty() {
+    let t = RealIntegrationCtx::setup();
+    let provider = Address::generate(&t.env);
+    let user = Address::generate(&t.env);
+    let merchant = Address::generate(&t.env);
+
+    t.fund_pool(&provider, 20_000);
+    t.register_merchant(&merchant, "Risk Merchant");
+    t.set_score(&user, 80);
+    t.mint(&user, 200);
+
+    t.env.ledger().set_timestamp(1_000);
+    let schedule = t.single_installment(1_000, 5_000);
+    let loan_id = t
+        .creditline
+        .create_loan(&user, &merchant, &1_000, &200, &schedule);
+
+    let creditline_balance_after_loan = t.balance(&t.creditline_id);
+    let pool_balance_after_loan = t.balance(&t.pool.address);
+
+    t.env.ledger().set_timestamp(5_001);
+    t.creditline.mark_defaulted(&loan_id);
+
+    let loan = t.creditline.get_loan(&loan_id);
+    let pool_stats = t.pool.get_pool_stats();
+    assert_eq!(loan.status, LoanStatus::Defaulted);
+    assert_eq!(t.reputation.get_score(&user), 60);
+    assert_eq!(
+        t.balance(&t.creditline_id),
+        creditline_balance_after_loan - 200
+    );
+    assert_eq!(t.balance(&t.pool.address), pool_balance_after_loan + 200);
+    assert_eq!(pool_stats.locked_liquidity, 600);
 }

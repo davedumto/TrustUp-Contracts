@@ -537,7 +537,10 @@ fn it_emits_score_changed_event_on_decrease() {
         }
     }
 
-    assert!(found_event, "SCORECHGD event with 'decrease' reason not found");
+    assert!(
+        found_event,
+        "SCORECHGD event with 'decrease' reason not found"
+    );
 }
 
 /// Test: Emits SCORECHGD event on score set

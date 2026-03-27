@@ -1,3 +1,4 @@
+use parameters_contract::ProtocolParameters;
 use soroban_sdk::{contracttype, Address};
 
 // Loan status enum
@@ -39,6 +40,10 @@ pub struct Loan {
     pub status: LoanStatus,
     pub created_at: u64, // Unix timestamp
     pub funded_at: u64,  // 0 means not funded yet
+}
+
+pub fn default_protocol_parameters() -> ProtocolParameters {
+    parameters_contract::default_parameters()
 }
 
 // Constants

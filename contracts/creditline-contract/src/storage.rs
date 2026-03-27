@@ -9,6 +9,8 @@ pub const REPUTATION_CONTRACT: Symbol = symbol_short!("REPCONT");
 pub const MERCHANT_REGISTRY: Symbol = symbol_short!("MERCHANT");
 pub const LIQUIDITY_POOL: Symbol = symbol_short!("LIQPOOL");
 pub const TOKEN: Symbol = symbol_short!("TOKEN");
+pub const PARAMETERS_CONTRACT: Symbol = symbol_short!("PARAMS");
+pub const REENTRANCY_LOCK: Symbol = symbol_short!("LOCKED");
 
 const LOAN_SHARD_COUNT: u32 = 32;
 
@@ -197,4 +199,25 @@ pub fn get_token(env: &Env) -> Option<Address> {
 /// Set the Token Contract address
 pub fn set_token(env: &Env, address: &Address) {
     env.storage().instance().set(&TOKEN, address);
+}
+
+/// Get the Parameters Contract address
+pub fn get_parameters_contract(env: &Env) -> Option<Address> {
+    env.storage().instance().get(&PARAMETERS_CONTRACT)
+}
+
+/// Set the Parameters Contract address
+pub fn set_parameters_contract(env: &Env, address: &Address) {
+    env.storage().instance().set(&PARAMETERS_CONTRACT, address);
+}
+
+pub fn is_reentrancy_locked(env: &Env) -> bool {
+    env.storage()
+        .instance()
+        .get(&REENTRANCY_LOCK)
+        .unwrap_or(false)
+}
+
+pub fn set_reentrancy_locked(env: &Env, locked: bool) {
+    env.storage().instance().set(&REENTRANCY_LOCK, &locked);
 }

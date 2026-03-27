@@ -9,6 +9,7 @@ pub const LOCKED_LIQUIDITY_KEY: Symbol = symbol_short!("LCKDLIQ");
 pub const CREDITLINE_KEY: Symbol = symbol_short!("CRDTLIN");
 pub const TREASURY_KEY: Symbol = symbol_short!("TREASURY");
 pub const MERCHANT_FUND_KEY: Symbol = symbol_short!("MRCHFND");
+pub const REENTRANCY_LOCK_KEY: Symbol = symbol_short!("LOCKED");
 
 // Persistent storage key prefix for LP shares
 pub const LP_SHARES_PREFIX: Symbol = symbol_short!("LPSHRS");
@@ -70,7 +71,9 @@ pub fn get_merchant_fund(env: &Env) -> Option<Address> {
 }
 
 pub fn set_merchant_fund(env: &Env, merchant_fund: &Address) {
-    env.storage().instance().set(&MERCHANT_FUND_KEY, merchant_fund);
+    env.storage()
+        .instance()
+        .set(&MERCHANT_FUND_KEY, merchant_fund);
 }
 
 // --- Total Shares ---
@@ -86,7 +89,10 @@ pub fn set_total_shares(env: &Env, total: i128) {
 // --- Total Liquidity ---
 
 pub fn get_total_liquidity(env: &Env) -> i128 {
-    env.storage().instance().get(&TOTAL_LIQUIDITY_KEY).unwrap_or(0)
+    env.storage()
+        .instance()
+        .get(&TOTAL_LIQUIDITY_KEY)
+        .unwrap_or(0)
 }
 
 pub fn set_total_liquidity(env: &Env, total: i128) {
@@ -119,4 +125,15 @@ pub fn set_lp_shares(env: &Env, provider: &Address, shares: i128) {
     env.storage()
         .persistent()
         .set(&(LP_SHARES_PREFIX, provider.clone()), &shares);
+}
+
+pub fn is_reentrancy_locked(env: &Env) -> bool {
+    env.storage()
+        .instance()
+        .get(&REENTRANCY_LOCK_KEY)
+        .unwrap_or(false)
+}
+
+pub fn set_reentrancy_locked(env: &Env, locked: bool) {
+    env.storage().instance().set(&REENTRANCY_LOCK_KEY, &locked);
 }

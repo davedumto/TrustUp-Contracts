@@ -2,6 +2,7 @@
 members = [
     "contracts/reputation-contract",
     "contracts/creditline-contract",
+    "contracts/parameters-contract",
     "contracts/merchant-registry-contract",
     "contracts/liquidity-pool-contract",
     "contracts/lp-contract"

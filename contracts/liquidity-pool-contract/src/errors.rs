@@ -14,4 +14,5 @@ pub enum LiquidityPoolError {
     Underflow = 8,
     NotCreditLine = 9,
     ZeroTotalShares = 10,
+    ReentrancyDetected = 11,
 }

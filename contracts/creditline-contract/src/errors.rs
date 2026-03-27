@@ -24,4 +24,6 @@ pub enum CreditLineError {
     MerchantValidationFailed = 17,
     ExposureLimitExceeded = 18,
     LoanNotCancellable = 19,
+    ParametersUnavailable = 20,
+    ReentrancyDetected = 21,
 }

@@ -1,36 +1,31 @@
 #![no_std]
 use liquidity_pool_contract::LiquidityPoolContractClient;
 use merchant_registry_contract::MerchantRegistryContractClient;
+use parameters_contract::ProtocolParameters;
 use soroban_sdk::{
+    auth::{ContractContext, InvokerContractAuthEntry, SubContractInvocation},
     contract, contractimpl, panic_with_error, symbol_short, token, Address, Env, IntoVal, Symbol,
-    Vec,
+    Val, Vec,
 };
 
-// Module imports
 mod access;
 mod errors;
 mod events;
 mod storage;
 mod types;
 
-// Re-export types for external use
 pub use errors::CreditLineError;
-pub use types::{Loan, LoanStatus, RepaymentInstallment};
+pub use types::{default_protocol_parameters, Loan, LoanStatus, RepaymentInstallment};
 
-/// CreditLine contract structure
 #[contract]
 pub struct CreditLineContract;
 
-/// Contract implementation
 #[contractimpl]
 impl CreditLineContract {
-    /// Get the version of this contract
     pub fn get_version() -> Symbol {
         symbol_short!("v1_0_0")
     }
 
-    /// Initialize the contract with admin and external contract addresses
-    /// Can only be called once (when admin is not set)
     pub fn initialize(
         env: Env,
         admin: Address,
@@ -39,7 +34,6 @@ impl CreditLineContract {
         liquidity_pool: Address,
         token: Address,
     ) {
-        // Check if already initialized
         let admin_opt: Option<Address> = env.storage().instance().get(&storage::ADMIN_KEY);
         if admin_opt.is_some() {
             panic!("Already initialized");
@@ -54,8 +48,6 @@ impl CreditLineContract {
         storage::set_token(&env, &token);
     }
 
-    /// Create a new loan
-    /// Validates all requirements and creates an active loan
     pub fn create_loan(
         env: Env,
         user: Address,
@@ -67,7 +59,11 @@ impl CreditLineContract {
         user.require_auth();
 
         Self::validate_guarantee(&env, total_amount, guarantee_amount);
+        Self::validate_merchant(&env, &merchant);
         let score = Self::validate_reputation(&env, &user);
+        Self::validate_liquidity(&env, total_amount, guarantee_amount);
+        Self::enter_non_reentrant(&env);
+
         let mut loan = Self::build_loan(
             &env,
             user.clone(),
@@ -78,15 +74,16 @@ impl CreditLineContract {
             score,
             LoanStatus::Active,
         );
-
-        Self::validate_liquidity(&env, total_amount, guarantee_amount);
-        Self::fund_loan_from_pool(&env, &user, &merchant, guarantee_amount, total_amount);
         loan.funded_at = env.ledger().timestamp();
 
         storage::increase_user_active_debt(&env, &user, loan.remaining_balance);
         let loan_id = loan.loan_id;
-
         storage::write_loan(&env, &loan);
+
+        let pool_contribution = total_amount
+            .checked_sub(guarantee_amount)
+            .unwrap_or_else(|| panic_with_error!(&env, CreditLineError::Underflow));
+        Self::fund_loan_from_pool(&env, &user, &merchant, guarantee_amount, pool_contribution);
 
         events::emit_loan_created(
             &env,
@@ -98,11 +95,10 @@ impl CreditLineContract {
             &repayment_schedule,
         );
 
+        Self::exit_non_reentrant(&env);
         loan_id
     }
 
-    /// Create an unfunded loan request. Borrower guarantee is escrowed until the
-    /// request is either funded by a future workflow or explicitly cancelled.
     pub fn request_loan(
         env: Env,
         user: Address,
@@ -147,7 +143,6 @@ impl CreditLineContract {
         loan_id
     }
 
-    /// Paginated borrower loan history for scalable reads.
     pub fn get_user_loans(env: Env, borrower: Address, start: u64, limit: u32) -> Vec<Loan> {
         storage::get_user_loans_paginated(&env, &borrower, start, limit)
     }
@@ -160,7 +155,6 @@ impl CreditLineContract {
         storage::get_user_active_debt(&env, &borrower)
     }
 
-    /// Get a loan by ID
     pub fn get_loan(env: Env, loan_id: u64) -> Loan {
         storage::read_loan(&env, loan_id)
             .unwrap_or_else(|| panic_with_error!(&env, CreditLineError::LoanNotFound))
@@ -178,31 +172,30 @@ impl CreditLineContract {
         storage::get_admin(&env)
     }
 
-    /// Set the reputation contract address (admin only)
     pub fn set_reputation_contract(env: Env, admin: Address, address: Address) {
         admin.require_auth();
         access::require_admin(&env, &admin);
-
         storage::set_reputation_contract(&env, &address);
     }
 
-    /// Set the merchant registry contract address (admin only)
     pub fn set_merchant_registry(env: Env, admin: Address, address: Address) {
         admin.require_auth();
         access::require_admin(&env, &admin);
-
         storage::set_merchant_registry(&env, &address);
     }
 
-    /// Set the liquidity pool contract address (admin only)
     pub fn set_liquidity_pool(env: Env, admin: Address, address: Address) {
         admin.require_auth();
         access::require_admin(&env, &admin);
-
         storage::set_liquidity_pool(&env, &address);
     }
 
-    /// Validate guarantee amount is at least 20% of total amount
+    pub fn set_parameters_contract(env: Env, admin: Address, address: Address) {
+        admin.require_auth();
+        access::require_admin(&env, &admin);
+        storage::set_parameters_contract(&env, &address);
+    }
+
     fn validate_guarantee(env: &Env, total_amount: i128, guarantee_amount: i128) {
         if total_amount <= 0 || guarantee_amount <= 0 {
             panic_with_error!(env, CreditLineError::InvalidAmount);
@@ -212,9 +205,9 @@ impl CreditLineContract {
             panic_with_error!(env, CreditLineError::InvalidAmount);
         }
 
-        // Calculate minimum guarantee (20% of total)
+        let params = Self::get_protocol_parameters(env);
         let min_guarantee = total_amount
-            .checked_mul(types::MIN_GUARANTEE_PERCENT)
+            .checked_mul(params.min_guarantee_percent as i128)
             .and_then(|v| v.checked_div(100))
             .unwrap_or_else(|| panic_with_error!(env, CreditLineError::Overflow));
 
@@ -223,7 +216,6 @@ impl CreditLineContract {
         }
     }
 
-    /// Validate merchant is registered and active
     fn validate_merchant(env: &Env, merchant: &Address) {
         let merchant_registry = storage::get_merchant_registry(env)
             .unwrap_or_else(|| panic_with_error!(env, CreditLineError::InvalidMerchant));
@@ -243,14 +235,9 @@ impl CreditLineContract {
         }
     }
 
-    /// Validate user has sufficient reputation
     fn validate_reputation(env: &Env, user: &Address) -> u32 {
         let reputation_contract = storage::get_reputation_contract(env)
             .unwrap_or_else(|| panic!("Reputation contract not configured"));
-
-        // Call the reputation contract to get user's score
-        // Using the reputation contract interface
-        use soroban_sdk::IntoVal;
 
         let score: u32 = env.invoke_contract(
             &reputation_contract,
@@ -258,7 +245,8 @@ impl CreditLineContract {
             (user,).into_val(env),
         );
 
-        if score < types::MIN_REPUTATION_THRESHOLD {
+        let params = Self::get_protocol_parameters(env);
+        if score < params.min_reputation_threshold {
             panic_with_error!(env, CreditLineError::InsufficientReputation);
         }
 
@@ -269,18 +257,19 @@ impl CreditLineContract {
         let liquidity_pool = storage::get_liquidity_pool(env)
             .unwrap_or_else(|| panic_with_error!(env, CreditLineError::InsufficientLiquidity));
 
+        let required_from_pool = total_amount
+            .checked_sub(guarantee_amount)
+            .unwrap_or_else(|| panic_with_error!(env, CreditLineError::Underflow));
+
+        if required_from_pool == 0 {
+            return;
+        }
+
         let lp_client = LiquidityPoolContractClient::new(env, &liquidity_pool);
         let stats = lp_client.get_pool_stats();
 
-        if stats.available_liquidity < total_amount {
+        if stats.available_liquidity < required_from_pool {
             panic_with_error!(env, CreditLineError::InsufficientLiquidity);
-        }
-
-        let required_guarantee = total_amount
-            .checked_sub(guarantee_amount)
-            .unwrap_or_else(|| panic_with_error!(env, CreditLineError::Underflow));
-        if required_guarantee < 0 {
-            panic_with_error!(env, CreditLineError::InvalidAmount);
         }
     }
 
@@ -289,7 +278,7 @@ impl CreditLineContract {
         borrower: &Address,
         merchant: &Address,
         guarantee_amount: i128,
-        principal_amount: i128,
+        pool_contribution: i128,
     ) {
         let liquidity_pool = storage::get_liquidity_pool(env)
             .unwrap_or_else(|| panic_with_error!(env, CreditLineError::InsufficientLiquidity));
@@ -298,11 +287,16 @@ impl CreditLineContract {
             .unwrap_or_else(|| panic_with_error!(env, CreditLineError::TokenNotConfigured));
 
         let token_client = token::Client::new(env, &token_address);
-        // Escrow borrower guarantee in CreditLine. It is forwarded to the pool only on default.
         token_client.transfer(borrower, &env.current_contract_address(), &guarantee_amount);
 
-        let lp_client = LiquidityPoolContractClient::new(env, &liquidity_pool);
-        lp_client.fund_loan(&env.current_contract_address(), merchant, &principal_amount);
+        if pool_contribution > 0 {
+            let lp_client = LiquidityPoolContractClient::new(env, &liquidity_pool);
+            lp_client.fund_loan(
+                &env.current_contract_address(),
+                merchant,
+                &pool_contribution,
+            );
+        }
     }
 
     fn build_loan(
@@ -318,7 +312,7 @@ impl CreditLineContract {
         Self::validate_guarantee(env, total_amount, guarantee_amount);
         Self::validate_merchant(env, &merchant);
 
-        let interest_rate_bps = Self::interest_rate_bps(score);
+        let interest_rate_bps = Self::interest_rate_bps(env, score);
         let interest_amount =
             Self::calculate_bps_amount(env, total_amount, interest_rate_bps as i128);
         let service_fee_amount =
@@ -364,12 +358,22 @@ impl CreditLineContract {
             .unwrap_or_else(|| panic_with_error!(env, CreditLineError::Overflow))
     }
 
-    fn interest_rate_bps(score: u32) -> u32 {
+    fn interest_rate_bps(env: &Env, score: u32) -> u32 {
+        let base_interest_bps = Self::get_protocol_parameters(env).base_interest_bps;
+        if base_interest_bps == 0 {
+            return match score {
+                90..=u32::MAX => 400,
+                75..=89 => 600,
+                60..=74 => 800,
+                _ => 1_000,
+            };
+        }
+
         match score {
-            90..=u32::MAX => 400,
-            75..=89 => 600,
-            60..=74 => 800,
-            _ => 1_000,
+            90..=u32::MAX => base_interest_bps.saturating_sub(600),
+            75..=89 => base_interest_bps.saturating_sub(400),
+            60..=74 => base_interest_bps.saturating_sub(200),
+            _ => base_interest_bps,
         }
     }
 
@@ -382,57 +386,46 @@ impl CreditLineContract {
         }
     }
 
-    /// Calculate appropriate penalty amount (20-30 points based on loan size)
-    fn calculate_default_penalty(loan: &Loan) -> u32 {
-        // Simple logic: 20 points base penalty, 30 points if loan > 5000 units
-        if loan.total_amount > 5000 {
-            30
+    fn calculate_default_penalty(env: &Env, loan: &Loan) -> u32 {
+        let params = Self::get_protocol_parameters(env);
+        if loan.total_amount > params.large_loan_threshold {
+            params.large_loan_default_penalty
         } else {
-            20
+            params.default_penalty
         }
     }
 
     pub fn mark_defaulted(env: Env, loan_id: u64) -> Result<(), CreditLineError> {
-        // 1. Validation: Loan must exist
         let mut loan = storage::read_loan(&env, loan_id).ok_or(CreditLineError::LoanNotFound)?;
 
-        // 2. Validation: Loan must be Active
         if loan.status != LoanStatus::Active {
             return Err(CreditLineError::LoanNotActive);
         }
 
-        // 3. Validation: Check if past final payment date
-        // We look at the last installment in the schedule
         let last_installment = loan
             .repayment_schedule
             .last()
-            .ok_or(CreditLineError::Overflow)?; // Should never happen with valid loans
+            .ok_or(CreditLineError::Overflow)?;
 
         if env.ledger().timestamp() <= last_installment.due_date {
             return Err(CreditLineError::LoanNotOverdue);
         }
 
-        // 4. Transfer guarantee to Liquidity Pool
         let lp_address =
             storage::get_liquidity_pool(&env).ok_or(CreditLineError::InsufficientLiquidity)?;
-        let token_address = storage::get_token(&env).ok_or(CreditLineError::TokenNotConfigured)?;
 
-        let token_client = token::Client::new(&env, &token_address);
-        token_client.transfer(
-            &env.current_contract_address(),
-            &lp_address,
-            &loan.guarantee_amount,
-        );
+        Self::enter_non_reentrant(&env);
+
+        loan.status = LoanStatus::Defaulted;
+        storage::decrease_user_active_debt(&env, &loan.borrower, loan.remaining_balance);
+        storage::write_loan(&env, &loan);
+
+        let token_address = storage::get_token(&env).ok_or(CreditLineError::TokenNotConfigured)?;
+        Self::authorize_token_transfer(&env, &token_address, &lp_address, loan.guarantee_amount);
 
         let lp_client = LiquidityPoolContractClient::new(&env, &lp_address);
         lp_client.receive_guarantee(&env.current_contract_address(), &loan.guarantee_amount);
 
-        // 5. Update Status
-        storage::decrease_user_active_debt(&env, &loan.borrower, loan.remaining_balance);
-        loan.status = LoanStatus::Defaulted;
-        storage::write_loan(&env, &loan);
-
-        // 6. Emit Event
         events::emit_loan_defaulted(
             &env,
             loan.borrower.clone(),
@@ -442,14 +435,9 @@ impl CreditLineContract {
             loan.guarantee_amount,
         );
 
-        // 7. Trigger reputation decrease
         if let Some(reputation_contract) = storage::get_reputation_contract(&env) {
-            let penalty = Self::calculate_default_penalty(&loan);
+            let penalty = Self::calculate_default_penalty(&env, &loan);
             let updater = env.current_contract_address();
-
-            // Call decrease_score(updater, user, amount)
-            // Error handling: if the reputation call fails, we still want the loan to be marked as defaulted.
-            // Using try_invoke_contract allows us to catch the failure and log it without rolling back the whole transaction.
             let _ = env.try_invoke_contract::<(), soroban_sdk::Error>(
                 &reputation_contract,
                 &Symbol::new(&env, "decrease_score"),
@@ -457,6 +445,7 @@ impl CreditLineContract {
             );
         }
 
+        Self::exit_non_reentrant(&env);
         Ok(())
     }
 
@@ -489,32 +478,26 @@ impl CreditLineContract {
         events::emit_loan_cancelled(&env, &loan.borrower, loan_id, loan.guarantee_amount);
     }
 
-    /// Repay a loan (partial or full)
-    /// Returns the remaining balance after payment
     pub fn repay_loan(env: Env, borrower: Address, loan_id: u64, amount: i128) -> i128 {
-        // 1. Auth first
         borrower.require_auth();
 
-        // 2. Load loan
         let mut loan = storage::read_loan(&env, loan_id)
             .unwrap_or_else(|| panic_with_error!(&env, CreditLineError::LoanNotFound));
 
-        // 3. Verify borrower matches
         if loan.borrower != borrower {
             panic_with_error!(&env, CreditLineError::UnauthorizedRepayer);
         }
 
-        // 4. Loan must be Active
         if loan.status != LoanStatus::Active {
             panic_with_error!(&env, CreditLineError::LoanNotActive);
         }
 
-        // 5. Amount must be > 0 and <= remaining_balance
         if amount <= 0 || amount > loan.remaining_balance {
             panic_with_error!(&env, CreditLineError::InvalidRepaymentAmount);
         }
 
-        // 6. Apply repayment principal-first to reduce protocol exposure earliest.
+        Self::enter_non_reentrant(&env);
+
         let principal_paid = amount.min(loan.principal_outstanding);
         let after_principal = amount
             .checked_sub(principal_paid)
@@ -538,32 +521,29 @@ impl CreditLineContract {
             .checked_sub(fee_paid)
             .unwrap_or_else(|| panic_with_error!(&env, CreditLineError::Underflow));
 
-        // 7. Calculate new remaining balance
         let new_balance = loan
             .remaining_balance
             .checked_sub(amount)
             .unwrap_or_else(|| panic_with_error!(&env, CreditLineError::Underflow));
 
-        // 8. Prepare updated loan state
         loan.remaining_balance = new_balance;
-
         let is_fully_repaid = new_balance == 0;
         if is_fully_repaid {
             loan.status = LoanStatus::Paid;
         }
 
-        // 9. Resolve external addresses before touching anything
+        storage::decrease_user_active_debt(&env, &borrower, amount);
+        storage::write_loan(&env, &loan);
+
         let lp_address = storage::get_liquidity_pool(&env)
             .unwrap_or_else(|| panic_with_error!(&env, CreditLineError::InsufficientLiquidity));
-
         let token_address = storage::get_token(&env)
             .unwrap_or_else(|| panic_with_error!(&env, CreditLineError::TokenNotConfigured));
 
-        // 10. Collect the repayment in CreditLine so the pool can pull it atomically.
         let token_client = token::Client::new(&env, &token_address);
         token_client.transfer(&borrower, &env.current_contract_address(), &amount);
+        Self::authorize_token_transfer(&env, &token_address, &lp_address, amount);
 
-        // 11. Notify pool — hard call so pool accounting stays in sync.
         let lp_client = LiquidityPoolContractClient::new(&env, &lp_address);
         lp_client.receive_repayment(
             &env.current_contract_address(),
@@ -581,11 +561,6 @@ impl CreditLineContract {
             );
         }
 
-        // 12. All external calls succeeded — now safe to commit state
-        storage::decrease_user_active_debt(&env, &borrower, amount);
-        storage::write_loan(&env, &loan);
-
-        // 13. Emit event
         events::emit_loan_repaid(
             &env,
             &borrower,
@@ -595,30 +570,61 @@ impl CreditLineContract {
             is_fully_repaid,
         );
 
-        // 14. Reputation increase on full repayment — soft side-effect, failure is acceptable.
         if is_fully_repaid {
             if let Some(reputation_contract) = storage::get_reputation_contract(&env) {
                 let updater = env.current_contract_address();
-                let score_bonus = loan
-                    .repayment_schedule
-                    .first()
-                    .map(|installment| {
-                        if env.ledger().timestamp() < installment.due_date {
-                            15u32
-                        } else {
-                            10u32
-                        }
-                    })
-                    .unwrap_or(10u32);
+                let params = Self::get_protocol_parameters(&env);
                 let _ = env.try_invoke_contract::<(), soroban_sdk::Error>(
                     &reputation_contract,
                     &Symbol::new(&env, "increase_score"),
-                    (updater, borrower, score_bonus).into_val(&env),
+                    (updater, borrower, params.full_repayment_reward).into_val(&env),
                 );
             }
         }
 
+        Self::exit_non_reentrant(&env);
         new_balance
+    }
+
+    fn get_protocol_parameters(env: &Env) -> ProtocolParameters {
+        match storage::get_parameters_contract(env) {
+            Some(address) => env
+                .try_invoke_contract::<ProtocolParameters, soroban_sdk::Error>(
+                    &address,
+                    &Symbol::new(env, "get_parameters"),
+                    ().into_val(env),
+                )
+                .unwrap_or_else(|_| panic_with_error!(env, CreditLineError::ParametersUnavailable))
+                .unwrap_or_else(|_| panic_with_error!(env, CreditLineError::ParametersUnavailable)),
+            None => default_protocol_parameters(),
+        }
+    }
+
+    fn enter_non_reentrant(env: &Env) {
+        if storage::is_reentrancy_locked(env) {
+            panic_with_error!(env, CreditLineError::ReentrancyDetected);
+        }
+        storage::set_reentrancy_locked(env, true);
+    }
+
+    fn exit_non_reentrant(env: &Env) {
+        storage::set_reentrancy_locked(env, false);
+    }
+
+    fn authorize_token_transfer(env: &Env, token_address: &Address, to: &Address, amount: i128) {
+        let args: Vec<Val> = (env.current_contract_address(), to.clone(), amount).into_val(env);
+        let context = ContractContext {
+            contract: token_address.clone(),
+            fn_name: Symbol::new(env, "transfer"),
+            args,
+        };
+        let invocation = SubContractInvocation {
+            context,
+            sub_invocations: Vec::new(env),
+        };
+        let mut auth_entries = Vec::new(env);
+        auth_entries.push_back(InvokerContractAuthEntry::Contract(invocation));
+        env.authorize_as_current_contract(auth_entries);
     }
 }
 
